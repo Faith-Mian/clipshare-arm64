@@ -201,7 +201,7 @@ jobs:
           echo "替换完成:"
           file "$LIB_DIR/liblua.so"
           echo "GLIBC 需求:"
-          readelf -V "$LIB_DIR/liblua.so" 2>/dev/null | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -5
+          readelf -V "$LIB_DIR/liblua.so" 2>/dev/null | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -5 || true
 
           # 记录到 summary
           {
@@ -242,12 +242,26 @@ jobs:
           [ "${{ inputs.debug }}" = "true" ] && set -x
 
           version="$(awk '/^version:/ {print $2; exit}' pubspec.yaml)"
-          arch="$(uname -m)"
-          # 上游硬编码 x64，这里按架构探测
-          bundle_dir="build/linux/${arch}/release/bundle"
+          # Flutter 的构建目录用 arm64 / x64 命名（不是 uname 的 aarch64/x86_64）
+          case "$(uname -m)" in
+            aarch64|arm64) flutter_arch="arm64" ;;
+            x86_64)        flutter_arch="x64" ;;
+            *) flutter_arch="" ;;
+          esac
+          bundle_dir="build/linux/${flutter_arch}/release/bundle"
+          # 兜底：若约定目录不存在，自动探测真正的 bundle 路径
+          if [[ ! -x "${bundle_dir}/clipshare" ]]; then
+            found="$(find build/linux -type f -path '*/release/bundle/clipshare' -print -quit 2>/dev/null || true)"
+            if [[ -n "${found}" ]]; then
+              bundle_dir="$(dirname "${found}")"
+              echo "约定目录不存在，自动探测到: ${bundle_dir}"
+            fi
+          fi
+          echo "Flutter 构建目录: ${bundle_dir}"
           if [[ ! -x "${bundle_dir}/clipshare" ]]; then
             echo "ERROR: 找不到 ${bundle_dir}/clipshare" >&2
-            ls -la build/linux/ 2>/dev/null || true
+            echo "实际构建目录列表:" >&2
+            find build/linux -maxdepth 4 -type d 2>/dev/null | sort >&2 || true
             exit 1
           fi
 
