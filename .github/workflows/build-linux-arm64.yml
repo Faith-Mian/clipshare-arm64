@@ -1,0 +1,375 @@
+name: Build ClipShare (Linux ARM64)
+
+# ============================================================
+# 独立构建脚本：在 GitHub 官方 ARM64 runner 上构建 ClipShare
+# 目标环境：Debian 13 (trixie, glibc 2.41) / 通用 aarch64 Linux
+#
+# 相对上游 build-linux.yml 的三个关键改动：
+#   1. runner 换成 ubuntu-24.04-arm（原生 ARM64，不用 QEMU）
+#   2. 按架构自动替换 flutter_embed_lua 里的 x86-64 liblua.so
+#      -> 用 aa2013/android-lua-lib 发布的 linux-arm64 版
+#   3. bundle 路径从硬编码 x64 改为按 uname -m 探测
+# ============================================================
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'ClipShare 版本 tag（建议 v1.5.5）'
+        required: true
+        default: 'v1.5.5'
+        type: string
+      liblua_tag:
+        description: 'android-lua-lib 的 release tag'
+        required: true
+        default: 'Lua-v5.4.8-for-Android-and-Linux'
+        type: string
+      publish_release:
+        description: '构建成功后发布到本仓库的 Release'
+        required: false
+        default: true
+        type: boolean
+      release_tag:
+        description: 'Release tag（留空则用 clipshare-arm64-<ref>）'
+        required: false
+        default: ''
+        type: string
+      debug:
+        description: '全程 set -x 输出调试日志'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  FLUTTER_VERSION: 3.41.9
+
+jobs:
+  build-arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+
+    steps:
+      # ----------------------------------------------------------
+      - name: 0. 环境与架构自检
+        run: |
+          echo "=== OS ==="; cat /etc/os-release | head -5
+          echo "=== glibc ==="; ldd --version | head -1
+          echo "=== arch ==="; uname -m
+          test "$(uname -m)" = "aarch64" || { echo "ERROR: 不是 aarch64 runner"; exit 1; }
+          df -h . | tail -1
+
+      # ----------------------------------------------------------
+      - name: 1. 安装 Linux 构建依赖
+        run: |
+          set -e
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            git curl unzip xz-utils zip file ca-certificates \
+            clang cmake ninja-build pkg-config build-essential lld \
+            rpm patchelf locales fuse libfuse-dev \
+            libgtk-3-dev liblzma-dev \
+            libkeybinder-3.0-dev \
+            libayatana-appindicator3-dev libayatana-indicator3-dev libayatana-ido3-0.4-dev \
+            libdbusmenu-glib-dev libdbusmenu-gtk3-dev \
+            libxtst-dev libx11-dev libwayland-dev wayland-protocols \
+            libnotify-dev libsecret-1-dev
+          sudo ldconfig
+
+      # ----------------------------------------------------------
+      - name: 2. Wayland ext-data-control 协议修复
+        # 上游注释：插件要求 wayland-protocols >= 1.34 提供
+        # staging/ext-data-control/ext-data-control-v1.xml，Ubuntu 24.04 自带版本缺该文件。
+        # 下载 1.41 的协议文件覆盖安装（只影响构建环境，不改源码）。
+        run: |
+          set -e
+          XML=/usr/share/wayland-protocols/staging/ext-data-control/ext-data-control-v1.xml
+          if [ -f "$XML" ]; then
+            echo "ext-data-control 协议已存在，跳过"
+          else
+            echo "安装 wayland-protocols 1.41 的 ext-data-control 协议"
+            cd /tmp
+            curl -fsSL -o wp141.deb \
+              "http://archive.ubuntu.com/ubuntu/pool/main/w/wayland-protocols/wayland-protocols_1.41-1_all.deb"
+            sudo dpkg-deb -x wp141.deb /tmp/wp141
+            sudo cp -a /tmp/wp141/usr/share/wayland-protocols/. /usr/share/wayland-protocols/
+          fi
+          ls -la /usr/share/wayland-protocols/staging/ext-data-control/
+
+      # ----------------------------------------------------------
+      - name: 3. 检出 ClipShare 源码（直接拉上游，无需上传/fork）
+        # repository 指定上游后，actions/checkout 会拉取完整历史与 tag。
+        # 本仓库只需放本 workflow 文件即可，无需把上游代码传进来。
+        uses: actions/checkout@v4
+        with:
+          repository: aa2013/ClipShare
+          ref: ${{ inputs.ref }}
+          path: src
+          submodules: false
+          fetch-depth: 0
+
+      - name: 4. 核对源码版本
+        working-directory: src
+        run: |
+          set -e
+          echo "目标版本: ${{ inputs.ref }}"
+          echo "HEAD: $(git rev-parse --short HEAD)"
+          echo "描述: $(git describe --tags --always 2>/dev/null || true)"
+          grep '^version:' pubspec.yaml
+
+      # ----------------------------------------------------------
+      - name: 5. 安装 Flutter ${{ env.FLUTTER_VERSION }}
+        run: |
+          set -e
+          git clone --depth 1 --branch "$FLUTTER_VERSION" \
+            https://github.com/flutter/flutter.git /opt/flutter
+          git config --global --add safe.directory /opt/flutter
+          echo "/opt/flutter/bin" >> "$GITHUB_PATH"
+          /opt/flutter/bin/flutter --version
+          /opt/flutter/bin/flutter config --enable-linux-desktop
+          /opt/flutter/bin/flutter doctor -v || true
+
+      - name: 6. pub get + Fastforge
+        working-directory: src
+        run: |
+          set -e
+          /opt/flutter/bin/flutter pub get
+          dart pub global activate fastforge
+          echo "$HOME/.pub-cache/bin" >> "$GITHUB_PATH"
+          "$HOME/.pub-cache/bin/fastforge" --version
+
+      # ----------------------------------------------------------
+      # 核心补丁：按架构替换 liblua.so
+      # ----------------------------------------------------------
+      - name: 7. 按架构替换 liblua.so（ARM64）
+        working-directory: src
+        run: |
+          set -euo pipefail
+          [ "${{ inputs.debug }}" = "true" ] && set -x
+
+          ARCH="$(uname -m)"
+          case "$ARCH" in
+            aarch64|arm64) LUA_ARCH="arm64" ;;
+            x86_64)        LUA_ARCH="x86_64" ;;
+            *) echo "ERROR: 不支持的架构 $ARCH"; exit 1 ;;
+          esac
+          echo "目标架构: $ARCH -> liblua-$LUA_ARCH"
+
+          # 定位 flutter_embed_lua 插件目录（pub get 后位于 .dart_tool/package_config.json）
+          PLUGIN_DIR=$(python3 - <<'PY'
+          import json, os
+          cfg = json.load(open('.dart_tool/package_config.json'))
+          for p in cfg['packages']:
+              if p['name'] == 'flutter_embed_lua':
+                  root = p['rootUri']
+                  # rootUri 形如 file:///path/to/plugin 或相对路径 uri:
+                  if root.startswith('file://'):
+                      root = root[7:]
+                  elif root.startswith('file:'):
+                      root = root[5:]
+                  print(os.path.abspath(root))
+                  break
+          PY
+          )
+          echo "插件目录: $PLUGIN_DIR"
+          test -n "$PLUGIN_DIR" || { echo "ERROR: 找不到 flutter_embed_lua 插件"; exit 1; }
+
+          LIB_DIR="$PLUGIN_DIR/linux/libs"
+          ls -la "$LIB_DIR"
+
+          # 确认当前库是 x86-64（上游预编译）
+          file "$LIB_DIR/liblua.so"
+
+          # 下载对应架构的 liblua.so
+          LUA_TAG="${{ inputs.liblua_tag }}"
+          LUA_URL="https://github.com/aa2013/android-lua-lib/releases/download/${LUA_TAG}/liblua-5.4.8-linux-${LUA_ARCH}.so"
+          echo "下载: $LUA_URL"
+          curl -fsSL -o /tmp/liblua-new.so "$LUA_URL"
+          file /tmp/liblua-new.so
+
+          # 架构校验：下载库必须匹配当前机器
+          if ! file /tmp/liblua-new.so | grep -qiE 'aarch64|ARM aarch64'; then
+            echo "ERROR: 下载的 liblua 不是 aarch64 架构"; exit 1
+          fi
+
+          # 备份原文件，替换为新库
+          cp -a "$LIB_DIR/liblua.so" "$LIB_DIR/liblua.so.x86_64.bak"
+          cp /tmp/liblua-new.so "$LIB_DIR/liblua.so"
+          chmod 755 "$LIB_DIR/liblua.so"
+          echo "替换完成:"
+          file "$LIB_DIR/liblua.so"
+          echo "GLIBC 需求:"
+          readelf -V "$LIB_DIR/liblua.so" 2>/dev/null | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -5
+
+          # 记录到 summary
+          {
+            echo "### liblua.so 架构替换"
+            echo "- 原库: \`$(file -b "$LIB_DIR/liblua.so.x86_64.bak")\`"
+            echo "- 新库: \`$(file -b "$LIB_DIR/liblua.so")\`"
+            echo "- 来源: $LUA_URL"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ----------------------------------------------------------
+      - name: 8. 构建 Linux Release
+        working-directory: src
+        run: |
+          set -e
+          [ "${{ inputs.debug }}" = "true" ] && set -x
+          /opt/flutter/bin/flutter build linux --release
+
+      # ----------------------------------------------------------
+      - name: 9. 打包 deb / rpm（Fastforge）
+        id: fastforge
+        working-directory: src
+        run: |
+          set -e
+          mkdir -p output
+          "$HOME/.pub-cache/bin/fastforge" package --platform linux --targets deb,rpm || {
+            echo "WARNING: Fastforge 打包失败，继续尝试 AppImage"
+          }
+          find dist -name "*.deb" -exec cp {} output/ \; 2>/dev/null || true
+          find dist -name "*.rpm" -exec cp {} output/ \; 2>/dev/null || true
+          ls -la output/
+
+      # ----------------------------------------------------------
+      - name: 10. 打包 AppImage（aarch64）
+        working-directory: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "${{ inputs.debug }}" = "true" ] && set -x
+
+          version="$(awk '/^version:/ {print $2; exit}' pubspec.yaml)"
+          arch="$(uname -m)"
+          # 上游硬编码 x64，这里按架构探测
+          bundle_dir="build/linux/${arch}/release/bundle"
+          if [[ ! -x "${bundle_dir}/clipshare" ]]; then
+            echo "ERROR: 找不到 ${bundle_dir}/clipshare" >&2
+            ls -la build/linux/ 2>/dev/null || true
+            exit 1
+          fi
+
+          app_name="ClipShare"
+          appimage_name="clipshare-${version}-linux-aarch64.AppImage"
+          appdir="AppDir"
+          rm -rf "${appdir}"
+          mkdir -p output "${appdir}"
+
+          cp -a "${bundle_dir}/." "${appdir}/"
+
+          # 补齐运行时库
+          runtime_libs=(
+            "libkeybinder-3.0.so.0"
+            "libayatana-appindicator3.so.1"
+            "libayatana-indicator3.so.7"
+            "libayatana-ido3-0.4.so.0"
+            "libdbusmenu-glib.so.4"
+            "libdbusmenu-gtk3.so.4"
+            "libXtst.so.6"
+          )
+          mkdir -p "${appdir}/lib"
+          for soname in "${runtime_libs[@]}"; do
+            if [[ -f "${appdir}/lib/${soname}" ]]; then continue; fi
+            lib_path="$(ldconfig -p | awk -v name="${soname}" '$1 == name { print $NF; exit }')"
+            if [[ -n "${lib_path}" && -f "${lib_path}" ]]; then
+              cp -L "${lib_path}" "${appdir}/lib/${soname}"
+            else
+              echo "WARNING: 运行时库未找到: ${soname}" >&2
+            fi
+          done
+
+          # AppRun
+          cat > "${appdir}/AppRun" << 'APPRUNEOF'
+          #!/bin/bash
+          HERE="$(dirname "$(readlink -f "$0")")"
+          export LD_LIBRARY_PATH="${HERE}/lib:${LD_LIBRARY_PATH}"
+          exec "${HERE}/clipshare" "$@"
+          APPRUNEOF
+          chmod +x "${appdir}/AppRun"
+
+          # desktop
+          cat > "${appdir}/${app_name}.desktop" << DESKTOPEOF
+          [Desktop Entry]
+          Name=${app_name}
+          Comment=Clipboard sharing tool (ARM64)
+          Exec=clipshare
+          Icon=clipshare
+          Type=Application
+          Categories=Utility;
+          Terminal=false
+          DESKTOPEOF
+
+          if [[ -f assets/images/logo/logo.png ]]; then
+            cp assets/images/logo/logo.png "${appdir}/clipshare.png"
+          fi
+
+          # appimagetool aarch64
+          curl -fsSL -o appimagetool \
+            "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-aarch64.AppImage"
+          chmod +x appimagetool
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          ./appimagetool "${appdir}" "output/${appimage_name}"
+          echo "AppImage: output/${appimage_name}"
+
+      # ----------------------------------------------------------
+      - name: 11. 产物校验
+        working-directory: src
+        run: |
+          set -e
+          echo "=== 产物清单 ==="
+          ls -lah output/
+          echo "=== ELF 架构校验 ==="
+          for f in output/*.AppImage; do file "$f"; done
+          echo "=== 校验 AppImage 内主程序架构 ==="
+          for f in output/*.AppImage; do
+            "${f}" --appimage-extract >/dev/null 2>&1 || true
+            file squashfs-root/clipshare 2>/dev/null || true
+            rm -rf squashfs-root
+          done
+          {
+            echo "### 产物"
+            ls -lh output/ | tail -n +2
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 12. 上传 Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: clipshare-linux-arm64
+          path: src/output/*
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 30
+
+      # ----------------------------------------------------------
+      - name: 13. 发布到本仓库 Release
+        if: ${{ inputs.publish_release && !cancelled() && success() }}
+        working-directory: src
+        run: |
+          set -e
+          TAG="${{ inputs.release_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="clipshare-arm64-${{ inputs.ref }}"
+          fi
+          echo "Release tag: $TAG"
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --title "ClipShare ARM64 (${{ inputs.ref }})" \
+              --notes "Unofficial ARM64 Linux build. Source: aa2013/ClipShare ${{ inputs.ref }}. GPL-3.0."
+          for f in output/*; do
+            gh release upload "$TAG" "$f" --clobber
+          done
+          echo "发布完成: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ----------------------------------------------------------
+      - name: 14. 失败时输出诊断
+        if: failure()
+        run: |
+          echo "=== 失败诊断 ==="
+          echo "请检查以上日志。常见问题："
+          echo "1. liblua.so 下载失败 -> 检查 liblua_tag 是否正确"
+          echo "2. wayland-protocols 缺 ext-data-control -> 检查 step 2 日志"
+          echo "3. Fastforge 打包失败不影响 AppImage -> 检查 step 10"
+          echo "4. Flutter 版本不匹配 -> 检查 FLUTTER_VERSION"
