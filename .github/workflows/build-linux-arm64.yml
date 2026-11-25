@@ -366,14 +366,19 @@ jobs:
           if [ -z "$TAG" ]; then
             TAG="clipshare-arm64-${{ inputs.ref }}"
           fi
+          # 必须显式指定 --repo：working-directory 在 src 下，git remote 指向上游，
+          # gh 默认会推断成 aa2013/ClipShare（无权写入 -> 403）
+          TARGET_REPO="${GITHUB_REPOSITORY}"
           echo "Release tag: $TAG"
-          gh release view "$TAG" >/dev/null 2>&1 || \
-            gh release create "$TAG" --title "ClipShare ARM64 (${{ inputs.ref }})" \
+          echo "目标仓库: ${TARGET_REPO}（当前 workflow 所在仓库，非上游）"
+          gh release view "$TAG" --repo "${TARGET_REPO}" >/dev/null 2>&1 || \
+            gh release create "$TAG" --repo "${TARGET_REPO}" \
+              --title "ClipShare ARM64 (${{ inputs.ref }})" \
               --notes "Unofficial ARM64 Linux build. Source: aa2013/ClipShare ${{ inputs.ref }}. GPL-3.0."
           for f in output/*; do
-            gh release upload "$TAG" "$f" --clobber
+            gh release upload "$TAG" "$f" --repo "${TARGET_REPO}" --clobber
           done
-          echo "发布完成: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+          echo "发布完成: https://github.com/${TARGET_REPO}/releases/tag/${TAG}"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
